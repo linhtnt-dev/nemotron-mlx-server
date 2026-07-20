@@ -1,5 +1,8 @@
 fastapi
 uvicorn[standard]
 python-multipart
-mlx-audio
 websockets
+# Nemotron ASR support isn't in a PyPI release of mlx-audio yet (latest is
+# 0.4.3) - it's merged into main, so install from GitHub instead:
+#   pip install "git+https://github.com/Blaizzy/mlx-audio.git"
+git+https://github.com/Blaizzy/mlx-audio.git

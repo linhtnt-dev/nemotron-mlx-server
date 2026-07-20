@@ -1,91 +1,91 @@
 """
-Nemotron ASR Server
-====================
+Nemotron ASR Server (OpenAI-compatible /v1/audio/transcriptions)
+=================================================================
 
-Single-file FastAPI server that loads a local Nemotron ASR model once
-(via mlx-audio) and exposes:
+Single-file FastAPI server that loads a local Nemotron 3.5 ASR model once
+(via mlx-audio's Nemotron support) and exposes:
 
-  * POST /v1/audio/transcriptions           - upload a full audio file
-  * WS   /v1/audio/transcriptions/stream    - realtime streaming audio (raw PCM16)
   * GET  /health                            - health check
-  * GET  /v1/models                         - OpenAI-style model listing stub
+  * GET  /v1/models                         - OpenAI-style model listing
+  * POST /v1/audio/transcriptions           - OpenAI-compatible transcription
+  * WS   /v1/audio/transcriptions/stream    - realtime streaming audio (custom protocol)
 
-IMPORTANT - read before running:
-  1. Set MODEL_PATH below to your local Nemotron checkpoint directory.
-  2. The exact mlx-audio Nemotron loading/inference call may differ by
-     version. The `load_model` / `model.transcribe` calls are the most
-     likely API shape as of mid-2025, but verify against the version you
-     installed (`pip show mlx-audio`, check its README/source).
-  3. The streaming endpoint here still re-transcribes the *entire*
-     accumulated buffer on every threshold hit. That is NOT true
-     incremental streaming - it works but adds latency and repeats
-     compute. See the "Real streaming" note near the bottom of this
-     file for what a proper RNN-T / cache-based implementation needs.
-  4. This server is OpenAI-*shaped* for the basic JSON response
-     ({"text": ...}), but it is NOT a drop-in OpenAI-compatible
-     endpoint. Missing: `model` field handling, `response_format`
-     (json/text/srt/vtt/verbose_json), auth header, and OpenAI error
-     envelope. The websocket stream protocol is custom - OpenAI's own
-     Realtime API uses a different event-based protocol
-     (session.created, input_audio_buffer.append, etc.), which this
-     does not replicate.
+Install:
+    pip install "git+https://github.com/Blaizzy/mlx-audio.git" fastapi uvicorn python-multipart
+
+  Nemotron support isn't in a PyPI release of mlx-audio yet (latest at time
+  of writing is 0.4.3) - it's merged into `main`, hence the git install.
+  Once it ships in a release, `pip install -U mlx-audio` will work instead.
+
+Before running:
+  1. Set MODEL_PATH below (or the NEMOTRON_MODEL_PATH env var) to your local
+     Nemotron checkpoint directory, or a mlx-community repo id such as
+     "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit" (mlx-audio's
+     `load()` will download it from the Hub if it's not a local path).
+  2. Verify the mlx-audio API shape against the version you installed -
+     confirmed against the mlx-community model card as of this writing:
+     `from mlx_audio.stt import load; model = load(path);
+     model.generate(audio_path, language=...).text`
+
+OpenAI compatibility notes:
+  * POST /v1/audio/transcriptions matches OpenAI's request shape
+    (multipart `file`, `model`, `language`, `prompt`, `response_format`,
+    `temperature`) and default JSON response `{"text": ...}`, so
+    `openai` SDK's `client.audio.transcriptions.create(...)` works
+    against this server unmodified.
+  * `verbose_json` returns `segments: []` here - this server does not
+    produce word/segment timestamps, so if your client depends on those,
+    they won't be populated.
+  * There's no auth check (any API key is accepted) and no OpenAI error
+    envelope (`{"error": {...}}`) - errors are plain FastAPI/HTTPException
+    JSON.
+  * This is NOT the OpenAI Realtime API. The /stream websocket below is a
+    custom protocol (raw PCM16 binary frames + a `{"type": "stop"}`
+    control message) - OpenAI's actual real-time transcription protocol
+    (`session.created`, `input_audio_buffer.append`, etc.) is not
+    implemented. `client.chat.completions.create(...)` also has no
+    meaning against an ASR-only server like this one.
 """
 
-import io
 import json
 import os
 import tempfile
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from mlx_audio.stt import load
+
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-MODEL_PATH = os.environ.get("NEMOTRON_MODEL_PATH", "/path/to/your/nemotron-model")
+MODEL_PATH = os.environ.get("NEMOTRON_MODEL_PATH", "/absolute/path/to/your/nemotron-model")
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 
-# Streaming assumptions - raw PCM16 mono audio pushed over the websocket.
+MODEL_ID = "nemotron-asr"
+
+# Streaming websocket assumptions - raw PCM16 mono audio.
 STREAM_SAMPLE_RATE = int(os.environ.get("STREAM_SAMPLE_RATE", "16000"))
 STREAM_CHANNELS = 1
 STREAM_CHUNK_TRIGGER_BYTES = int(os.environ.get("STREAM_CHUNK_TRIGGER_BYTES", "32000"))  # ~1s at 16kHz/16-bit
 
 # ============================================================
-# MODEL
+# LOAD MODEL ONCE
 # ============================================================
 
-print(f"Loading Nemotron ASR from: {MODEL_PATH}")
+print(f"Loading model from: {MODEL_PATH}")
 
-# Adjust this import/API depending on the exact mlx-audio
-# Nemotron implementation you installed.
-from mlx_audio.stt import load_model
+model = load(MODEL_PATH)
 
-model = load_model(MODEL_PATH)
-
-print("Nemotron ASR loaded successfully.")
-
-
-def _extract_text(result) -> str:
-    """Normalize whatever mlx-audio returns into a plain string."""
-    if hasattr(result, "text"):
-        return result.text
-    if isinstance(result, dict):
-        return result.get("text", "")
-    return str(result)
+print("Model loaded successfully.")
 
 
 def _pcm16_bytes_to_wav_file(pcm_bytes: bytes, path: str, sample_rate: int, channels: int) -> None:
-    """Wrap raw PCM16 bytes in a valid WAV container and write to `path`.
-
-    Writing raw bytes straight into a file with a `.wav` suffix (without a
-    real WAV header) is invalid and most decoders will reject it. This
-    builds a minimal, correct RIFF/WAVE header instead of depending on an
-    extra numpy/soundfile round-trip.
-    """
+    """Wrap raw PCM16 bytes in a valid WAV container and write to `path`."""
     import wave
 
     with wave.open(path, "wb") as wf:
@@ -96,11 +96,11 @@ def _pcm16_bytes_to_wav_file(pcm_bytes: bytes, path: str, sample_rate: int, chan
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
-    title="Nemotron ASR Server",
+    title="Nemotron ASR OpenAI-Compatible Server",
     version="1.0.0",
 )
 
@@ -113,12 +113,12 @@ app = FastAPI(
 async def health():
     return {
         "status": "ok",
-        "model": MODEL_PATH,
+        "model": MODEL_ID,
     }
 
 
 # ============================================================
-# OpenAI-style model listing stub (cosmetic compatibility only)
+# OPENAI-COMPATIBLE: GET /v1/models
 # ============================================================
 
 @app.get("/v1/models")
@@ -127,8 +127,9 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": "nemotron-asr",
+                "id": MODEL_ID,
                 "object": "model",
+                "created": 0,
                 "owned_by": "local",
             }
         ],
@@ -136,44 +137,104 @@ async def list_models():
 
 
 # ============================================================
-# NORMAL TRANSCRIPTION
-# OpenAI-shaped endpoint (see module docstring for caveats)
+# OPENAI-COMPATIBLE:
+#
+# POST /v1/audio/transcriptions
+#
+# Compatible with:
+#
+# client.audio.transcriptions.create(
+#     model="nemotron-asr",
+#     file=audio_file,
+# )
 # ============================================================
 
 @app.post("/v1/audio/transcriptions")
-async def transcribe(
+async def create_transcription(
     file: UploadFile = File(...),
-    model_name: Optional[str] = None,
+    model_name: str = Form(MODEL_ID, alias="model"),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    temperature: float = Form(0.0),
 ):
-    """
-    Example:
+    # --------------------------------------------------------
+    # Validate model
+    # --------------------------------------------------------
+    if model_name != MODEL_ID:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
-    curl http://localhost:8000/v1/audio/transcriptions \\
-      -X POST \\
-      -F "file=@audio.wav"
-    """
+    # --------------------------------------------------------
+    # Validate response format
+    # --------------------------------------------------------
+    supported_formats = {"json", "text", "verbose_json"}
+    if response_format not in supported_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported response_format '{response_format}'",
+        )
 
-    audio_bytes = await file.read()
+    # --------------------------------------------------------
+    # Save uploaded audio temporarily
+    # --------------------------------------------------------
+    suffix = os.path.splitext(file.filename or ".wav")[1]
+    audio_data = await file.read()
 
-    if not audio_bytes:
-        return JSONResponse(status_code=400, content={"error": "empty file"})
+    if not audio_data:
+        raise HTTPException(status_code=400, detail="empty file")
 
-    suffix = os.path.splitext(file.filename or ".wav")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+        temp_path = temp_file.name
+        temp_file.write(audio_data)
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as temp_file:
-        temp_file.write(audio_bytes)
-        temp_file.flush()
+    try:
+        # ----------------------------------------------------
+        # RUN NEMOTRON ASR
+        # ----------------------------------------------------
+        generate_kwargs = {
+            "audio": temp_path,
+            "temperature": temperature,
+        }
 
+        # Nemotron 3.5 ASR supports language-ID prompt conditioning,
+        # e.g. language="en-US", "vi-VN", "zh-CN". Omit for auto-detect.
+        if language:
+            generate_kwargs["language"] = language
+
+        result = model.generate(**generate_kwargs)
+        text = result.text
+
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+    finally:
         try:
-            result = model.transcribe(temp_file.name)
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            os.remove(temp_path)
+        except OSError:
+            pass
 
-    return JSONResponse(content={"text": _extract_text(result)})
+    # ========================================================
+    # OPENAI RESPONSE FORMATS
+    # ========================================================
+
+    if response_format == "text":
+        return JSONResponse(content=text, media_type="text/plain")
+
+    if response_format == "verbose_json":
+        return {
+            "task": "transcribe",
+            "language": language,
+            "duration": None,
+            "text": text,
+            "segments": [],  # not populated - see module docstring
+        }
+
+    # Default: json
+    return {"text": text}
 
 
 # ============================================================
-# REALTIME WEBSOCKET STREAMING
+# REALTIME WEBSOCKET STREAMING (custom protocol, not OpenAI Realtime API)
 # ============================================================
 
 @app.websocket("/v1/audio/transcriptions/stream")
@@ -188,6 +249,14 @@ async def transcribe_stream(websocket: WebSocket):
       - {"type": "partial", "text": "..."}  after each chunk threshold
       - {"type": "final", "text": "..."}    on stop
       - {"type": "error", "error": "..."}   on failure
+
+    NOTE: this re-decodes the whole accumulated buffer on every threshold
+    hit rather than doing true incremental decoding. Nemotron 3.5 is a
+    cache-aware streaming FastConformer-RNNT model, so a production
+    implementation should feed fixed-size frames into its streaming
+    cache/state (check mlx-audio's Nemotron streaming API - e.g. an
+    `att_context_size` / cache object) and emit partials per frame instead
+    of re-running `generate()` over the whole growing buffer.
     """
 
     await websocket.accept()
@@ -199,16 +268,10 @@ async def transcribe_stream(websocket: WebSocket):
         while True:
             message = await websocket.receive()
 
-            # ------------------------------------------------
-            # BINARY AUDIO CHUNK
-            # ------------------------------------------------
             if "bytes" in message and message["bytes"] is not None:
                 chunk = message["bytes"]
                 audio_buffer.extend(chunk)
 
-                # NOTE: this re-transcribes the whole buffer each time.
-                # See module docstring - this is a placeholder, not true
-                # incremental streaming.
                 if len(audio_buffer) > STREAM_CHUNK_TRIGGER_BYTES:
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_file:
                         _pcm16_bytes_to_wav_file(
@@ -218,16 +281,11 @@ async def transcribe_stream(websocket: WebSocket):
                             STREAM_CHANNELS,
                         )
                         try:
-                            result = model.transcribe(temp_file.name)
-                            await websocket.send_json(
-                                {"type": "partial", "text": _extract_text(result)}
-                            )
+                            result = model.generate(audio=temp_file.name)
+                            await websocket.send_json({"type": "partial", "text": result.text})
                         except Exception as e:
                             await websocket.send_json({"type": "error", "error": str(e)})
 
-            # ------------------------------------------------
-            # JSON CONTROL MESSAGE
-            # ------------------------------------------------
             elif "text" in message and message["text"] is not None:
                 data = json.loads(message["text"])
 
@@ -242,8 +300,8 @@ async def transcribe_stream(websocket: WebSocket):
                                 STREAM_CHANNELS,
                             )
                             try:
-                                result = model.transcribe(temp_file.name)
-                                text = _extract_text(result)
+                                result = model.generate(audio=temp_file.name)
+                                text = result.text
                             except Exception as e:
                                 await websocket.send_json({"type": "error", "error": str(e)})
 
@@ -256,22 +314,7 @@ async def transcribe_stream(websocket: WebSocket):
 
 
 # ============================================================
-# "Real streaming" note
-# ============================================================
-# For low-latency production streaming you do not want to re-run
-# model.transcribe() on the whole growing buffer. Nemotron's
-# RNN-T/streaming variants expose (depending on the exact mlx-audio
-# release) something like an encoder cache / decoder state object that
-# you feed fixed-size audio frames into incrementally, pulling out
-# partial hypotheses per frame instead of per full-buffer decode. Check
-# the specific model card / mlx-audio source for a `streaming_transcribe`,
-# `StreamingState`, or similar API before shipping this to production -
-# the code above intentionally keeps the naive "re-decode the buffer"
-# approach so it runs today with a stock mlx-audio Nemotron build.
-
-
-# ============================================================
-# RUN SERVER
+# START SERVER
 # ============================================================
 
 if __name__ == "__main__":
