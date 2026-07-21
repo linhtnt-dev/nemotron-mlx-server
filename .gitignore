@@ -4,3 +4,4 @@ __pycache__/
 venv/
 *.wav
 .DS_Store
+models/
