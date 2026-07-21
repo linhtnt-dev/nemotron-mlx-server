@@ -10,12 +10,14 @@ Usage:
 
 import asyncio
 import json
+import os
 import sys
 import wave
 
 import websockets
 
-WS_URL = "ws://localhost:8000/v1/audio/transcriptions/stream"
+API_KEY = os.environ.get("NEMOTRON_API_KEY", "sk-nemotron-local-9f3a1c7d4e2b8f01")
+WS_URL = f"ws://localhost:8000/v1/audio/transcriptions/stream?api_key={API_KEY}"
 CHUNK_FRAMES = 3200  # ~0.2s at 16kHz
 
 

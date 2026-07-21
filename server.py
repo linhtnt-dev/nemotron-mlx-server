@@ -49,10 +49,12 @@ OpenAI compatibility notes:
 
 import json
 import os
+import secrets
 import tempfile
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse
 
 from mlx_audio.stt import load
@@ -68,6 +70,15 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 MODEL_ID = "nemotron-asr"
 
+# --------------------------------------------------------------
+# Hardcoded API key (dev/local use only!)
+#
+# Override with an env var before exposing this server beyond
+# localhost:
+#   export NEMOTRON_API_KEY="something-you-generate-yourself"
+# --------------------------------------------------------------
+API_KEY = os.environ.get("NEMOTRON_API_KEY", "sk-nemotron-local-9f3a1c7d4e2b8f01")
+
 # Streaming websocket assumptions - raw PCM16 mono audio.
 STREAM_SAMPLE_RATE = int(os.environ.get("STREAM_SAMPLE_RATE", "16000"))
 STREAM_CHANNELS = 1
@@ -82,6 +93,30 @@ print(f"Loading model from: {MODEL_PATH}")
 model = load(MODEL_PATH)
 
 print("Model loaded successfully.")
+
+
+def _openai_error(message: str, err_type: str = "invalid_request_error", code: Optional[str] = None) -> dict:
+    return {"error": {"message": message, "type": err_type, "code": code}}
+
+
+async def verify_api_key(authorization: Optional[str] = Header(default=None)) -> None:
+    """OpenAI-style bearer auth: `Authorization: Bearer <API_KEY>`."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail=_openai_error(
+                "You didn't provide an API key. You need to provide your API key in an "
+                "Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
+                code="missing_api_key",
+            ),
+        )
+
+    token = authorization[len("Bearer "):].strip()
+    if not secrets.compare_digest(token, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail=_openai_error("Incorrect API key provided.", code="invalid_api_key"),
+        )
 
 
 def _pcm16_bytes_to_wav_file(pcm_bytes: bytes, path: str, sample_rate: int, channels: int) -> None:
@@ -105,6 +140,14 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(StarletteHTTPException)
+async def openai_style_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Make every HTTPException in this app render as OpenAI's {"error": {...}} envelope."""
+    detail = exc.detail
+    content = detail if isinstance(detail, dict) and "error" in detail else _openai_error(str(detail))
+    return JSONResponse(status_code=exc.status_code, content=content)
+
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
@@ -121,7 +164,7 @@ async def health():
 # OPENAI-COMPATIBLE: GET /v1/models
 # ============================================================
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models():
     return {
         "object": "list",
@@ -149,7 +192,7 @@ async def list_models():
 # )
 # ============================================================
 
-@app.post("/v1/audio/transcriptions")
+@app.post("/v1/audio/transcriptions", dependencies=[Depends(verify_api_key)])
 async def create_transcription(
     file: UploadFile = File(...),
     model_name: str = Form(MODEL_ID, alias="model"),
@@ -258,6 +301,19 @@ async def transcribe_stream(websocket: WebSocket):
     `att_context_size` / cache object) and emit partials per frame instead
     of re-running `generate()` over the whole growing buffer.
     """
+
+    # Auth: accept either `?api_key=...` or an `Authorization: Bearer ...`
+    # header on the handshake (browsers can't set custom headers on WS
+    # connections, so the query param is the practical option for JS clients).
+    supplied_key = websocket.query_params.get("api_key")
+    if not supplied_key:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            supplied_key = auth_header[len("Bearer "):].strip()
+
+    if not supplied_key or not secrets.compare_digest(supplied_key, API_KEY):
+        await websocket.close(code=4401, reason="invalid or missing api_key")
+        return
 
     await websocket.accept()
     print("WebSocket client connected.")

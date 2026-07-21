@@ -46,9 +46,30 @@ python server.py
 
 Server listens on `http://0.0.0.0:8000` by default (override with `HOST`/`PORT` env vars).
 
+## Auth
+
+Every endpoint except `/health` requires an API key. There's a **hardcoded
+default key for local dev** in `server.py`:
+
+```
+sk-nemotron-local-9f3a1c7d4e2b8f01
+```
+
+Override it before running anywhere reachable beyond `localhost`:
+
+```bash
+export NEMOTRON_API_KEY="something-you-generate-yourself"
+```
+
+HTTP requests send it as `Authorization: Bearer <key>`. The WebSocket
+endpoint accepts it either as a `?api_key=<key>` query param (browsers
+can't set custom headers on WS handshakes) or the same `Authorization`
+header if your client supports it. Wrong/missing key → `401` with an
+OpenAI-shaped `{"error": {...}}` body (HTTP) or WS close code `4401`.
+
 ## Test
 
-Health check:
+Health check (no auth):
 
 ```bash
 curl http://localhost:8000/health
@@ -59,6 +80,7 @@ Transcribe a file:
 ```bash
 curl http://localhost:8000/v1/audio/transcriptions \
   -X POST \
+  -H "Authorization: Bearer sk-nemotron-local-9f3a1c7d4e2b8f01" \
   -F "file=@audio.wav" \
   -F "model=nemotron-asr"
 ```
@@ -69,6 +91,7 @@ e.g. `en-US`, `vi-VN`, `zh-CN`):
 ```bash
 curl http://localhost:8000/v1/audio/transcriptions \
   -X POST \
+  -H "Authorization: Bearer sk-nemotron-local-9f3a1c7d4e2b8f01" \
   -F "file=@audio.wav" \
   -F "model=nemotron-asr" \
   -F "language=vi-VN"
@@ -79,6 +102,7 @@ Plain-text response:
 ```bash
 curl http://localhost:8000/v1/audio/transcriptions \
   -X POST \
+  -H "Authorization: Bearer sk-nemotron-local-9f3a1c7d4e2b8f01" \
   -F "file=@audio.wav" \
   -F "model=nemotron-asr" \
   -F "response_format=text"
@@ -89,7 +113,10 @@ With the OpenAI Python SDK:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="sk-nemotron-local-9f3a1c7d4e2b8f01",
+)
 
 with open("audio.wav", "rb") as audio:
     result = client.audio.transcriptions.create(model="nemotron-asr", file=audio)
@@ -116,10 +143,12 @@ What matches OpenAI's Audio Transcriptions API:
 - Works unmodified with `openai-python`'s
   `client.audio.transcriptions.create(model="nemotron-asr", file=...)`
 
+- Bearer API key auth on every endpoint except `/health`, and errors
+  render as OpenAI's `{"error": {"message", "type", "code"}}` envelope
+
 What's still different from the real API:
-- No auth check — any API key is accepted, there's no real key validation
-- No OpenAI-style error envelope (`{"error": {...}}`) — errors are plain
-  FastAPI/HTTPException JSON
+- The API key is a single hardcoded shared secret (env-overridable), not
+  per-user keys with usage tracking/rate limits like real OpenAI keys
 - `verbose_json` returns `segments: []` — no word/segment timestamps
 - `client.chat.completions.create(...)` has no meaning here — this only
   implements the transcription endpoint, not Chat Completions
